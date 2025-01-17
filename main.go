@@ -1,93 +1,127 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/cilium/ebpf/rlimit"
-	litm_bpf "github.com/raw-phil/litm/internal/bpf"
+	bpf "github.com/raw-phil/litm/internal/bpf"
+	logger "github.com/raw-phil/litm/internal/core"
+)
+
+var (
+	port   = flag.Uint("p", 0, "Port where the server is listening")
+	ip     = flag.String("ip", "", "Ip (IPv4 or IPv6) where the server is listening")
+	format = flag.Bool("F", false, "Remove info logs to produce output that is suitable for processing by another program")
 )
 
 func main() {
 
-	stopper := make(chan os.Signal, 1)
-	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
-
-	pid := flag.Uint("p", 0, "Process ID to monitor")
-	listenFd := flag.Int64("fd", 0, "File descriptor to monitor")
-
-	// Parse the flags
 	flag.Parse()
 
-	if *pid == 0 || *listenFd == 0 {
+	// Variable where the error causing LITM termination is saved.
+	var gErr error
+	defer exit(&gErr)
+
+	if *ip == "" || *port == 0 {
 		flag.Usage()
 		os.Exit(1)
 	}
+	dAddr := net.ParseIP(*ip)
+	if dAddr == nil {
+		gErr = fmt.Errorf("invalid ip: %s", *ip)
+		flag.Usage()
+		return
+	}
+	pid, command, fd, err := getServerInfo(dAddr, uint16(*port))
+	if err != nil {
+		gErr = err
+		return
+	}
+
+	if !*format {
+		defer log.Println("Litm terminated")
+		log.Printf("LITM attched to server:\n\t- pid: %d\n\t- cmd: %s\n\t- ip: %s\n\t- port: %d\n", pid, command, dAddr, *port)
+	}
+
+	// -----------------------------------------------------------------------------------------------------------------------
 
 	// Remove resource limits for kernels <5.11.
-	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatalf("Removing memlock: %s", err.Error())
+	if err = rlimit.RemoveMemlock(); err != nil {
+		gErr = fmt.Errorf("RemoveMemlock(): %w", err)
+		return
+	}
+
+	if err = bpf.CheckKernelFeatures(); err != nil {
+		gErr = err
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	defer cleanBpf(cancel, &wg)
+
+	wg.Add(1)
+	objs, err := bpf.LoadPrograms(ctx, &wg, uint32(pid), int64(fd), dAddr, uint16(*port))
+	if err != nil {
+		gErr = err
+		return
+	}
+
+	wg.Add(1)
+	err = bpf.LinkPrograms(ctx, &wg, objs)
+	if err != nil {
+		gErr = err
+		return
 	}
 
 	// -----------------------------------------------------------------------------------------------------------------------
 
-	if err := litm_bpf.CheckKernelFeatures(); err != nil {
-		log.Fatalf("error: %s", err.Error())
-	}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	objs, progsClean, err := litm_bpf.LoadPrograms(uint32(*pid), *listenFd)
+	l, err := logger.NewLitm(objs.EventRb, objs.ErrorRb, objs.ConnInfoRb)
 	if err != nil {
-		log.Fatalf("error: %s", err.Error())
+		gErr = err
+		return
 	}
-	defer progsClean()
 
-	linksClean, err := litm_bpf.LinkPrograms(objs)
-	if err != nil {
-		log.Fatalf("error: %s", err.Error())
-	}
-	defer linksClean()
-
-	// -----------------------------------------------------------------------------------------------------------------------
-
-	errCh, cleanErrorRb, err := litm_bpf.HandleErrorEventsRb(objs)
-	if err != nil {
-		log.Fatalf("error: %s", err.Error())
-	}
-	defer cleanErrorRb()
+	resCh, errorCh, done := l.Start()
 
 	go func() {
-		for e := range errCh {
-			log.Printf("Error event received: %d %s", e.Code, string(e.Description[:]))
+		for res := range resCh {
+			if err = logger.ClfLog(res); err != nil {
+				fmt.Fprintf(os.Stderr, "error: litm: %s\n", err.Error())
+			}
 		}
 	}()
 
-	connCh, cleanConnRb, err := litm_bpf.HandleConnEventsRb(objs)
-	if err != nil {
-		log.Fatalf("error: %s", err.Error())
-	}
-	defer cleanConnRb()
-
-	go func() {
-		for e := range connCh {
-			log.Printf("Connection event received: %d %d", e.Fd, e.Event)
+	select {
+	case <-sigCh:
+		stop := make(chan struct{})
+		go func() {
+			l.Stop()
+			close(stop)
+		}()
+		select {
+		case <-stop:
+		case <-time.After(3 * time.Second):
 		}
-	}()
-
-	readCh, cleanReadRb, err := litm_bpf.HandleReadEventsRb(objs)
-	if err != nil {
-		log.Fatalf("error: %s", err.Error())
-	}
-	defer cleanReadRb()
-
-	go func() {
-		for e := range readCh {
-			log.Printf("Read event received, fd: %d data:\n%s", e.Fd, e.Data[:])
+	case <-done:
+		select {
+		case err, ok := <-errorCh:
+			if ok {
+				gErr = fmt.Errorf("litm: %w", err)
+			}
+		default:
 		}
-	}()
-
-	<-stopper
-
+	}
 }

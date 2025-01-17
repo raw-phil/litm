@@ -12,38 +12,49 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type litmConnEvent uint32
-
-const (
-	litmConnEventOPEN  litmConnEvent = 0
-	litmConnEventCLOSE litmConnEvent = 1
-)
-
 type litmConnEventT struct {
-	Fd    int64
-	Event litmConnEvent
-	_     [4]byte
+	Type litmEventType
+	_    [4]byte
+	Fd   int64
+}
+
+type litmConnInfoEventT struct {
+	Family uint16
+	Sport  uint16
+	Saddr  [16]uint8
+}
+
+type litmDataEventT struct {
+	Type litmEventType
+	Size uint32
+	Fd   int64
+	Buf  [1024]uint8
 }
 
 type litmErrorCode uint32
 
 const (
-	litmErrorCodeWR_CONN_RB_FAIL litmErrorCode = 0
-	litmErrorCodeWR_READ_RB_FAIL litmErrorCode = 1
-	litmErrorCodeMSG_TOO_BIG     litmErrorCode = 2
+	litmErrorCodeWR_EVENT_RB_FAIL     litmErrorCode = 4294967295
+	litmErrorCodeWR_BAD_EVENT_T       litmErrorCode = 4294967294
+	litmErrorCodeWR_INFO_RB_FAIL      litmErrorCode = 4294967293
+	litmErrorCodeMAP_OPERATION_FAIL   litmErrorCode = 4294967292
+	litmErrorCodePROBE_READ_USER_FAIL litmErrorCode = 4294967291
+	litmErrorCodeSERVER_EXIT          litmErrorCode = 4294967290
 )
 
-type litmErrorEventT struct {
+type litmErrorT struct {
 	Code        litmErrorCode
 	Description [64]uint8
 }
 
-type litmReadEventT struct {
-	Fd     int64
-	Msg    [256]uint8
-	MsgLen uint32
-	_      [4]byte
-}
+type litmEventType uint32
+
+const (
+	litmEventTypeC_OPEN   litmEventType = 0
+	litmEventTypeC_CLOSE  litmEventType = 1
+	litmEventTypeDATA_IN  litmEventType = 2
+	litmEventTypeDATA_OUT litmEventType = 3
+)
 
 // loadLitm returns the embedded CollectionSpec for litm.
 func loadLitm() (*ebpf.CollectionSpec, error) {
@@ -80,31 +91,53 @@ func loadLitmObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 type litmSpecs struct {
 	litmProgramSpecs
 	litmMapSpecs
+	litmVariableSpecs
 }
 
-// litmSpecs contains programs before they are loaded into the kernel.
+// litmProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type litmProgramSpecs struct {
+	GetConnInfo    *ebpf.ProgramSpec `ebpf:"get_conn_info"`
+	ServerExit     *ebpf.ProgramSpec `ebpf:"server_exit"`
 	SysEnterAccept *ebpf.ProgramSpec `ebpf:"sys_enter_accept"`
 	SysEnterClose  *ebpf.ProgramSpec `ebpf:"sys_enter_close"`
-	SysEnterRead   *ebpf.ProgramSpec `ebpf:"sys_enter_read"`
+	SysEnterIo     *ebpf.ProgramSpec `ebpf:"sys_enter_io"`
 	SysExitAccept  *ebpf.ProgramSpec `ebpf:"sys_exit_accept"`
-	SysExitClose   *ebpf.ProgramSpec `ebpf:"sys_exit_close"`
-	SysExitRead    *ebpf.ProgramSpec `ebpf:"sys_exit_read"`
+	SysExitIn      *ebpf.ProgramSpec `ebpf:"sys_exit_in"`
+	SysExitInV     *ebpf.ProgramSpec `ebpf:"sys_exit_in_v"`
+	SysExitOut     *ebpf.ProgramSpec `ebpf:"sys_exit_out"`
+	SysExitOutV    *ebpf.ProgramSpec `ebpf:"sys_exit_out_v"`
 }
 
 // litmMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type litmMapSpecs struct {
-	ActiveAcceptMap   *ebpf.MapSpec `ebpf:"active_accept_map"`
-	ActiveCloseMap    *ebpf.MapSpec `ebpf:"active_close_map"`
-	ActiveReadArgsMap *ebpf.MapSpec `ebpf:"active_read_args_map"`
-	ConnEventsRb      *ebpf.MapSpec `ebpf:"conn_events_rb"`
-	ConnMap           *ebpf.MapSpec `ebpf:"conn_map"`
-	ErrorEventsRb     *ebpf.MapSpec `ebpf:"error_events_rb"`
-	ReadEventsRb      *ebpf.MapSpec `ebpf:"read_events_rb"`
+	ActiveAcceptMap *ebpf.MapSpec `ebpf:"active_accept_map"`
+	ActiveIoMap     *ebpf.MapSpec `ebpf:"active_io_map"`
+	ConnInfoRb      *ebpf.MapSpec `ebpf:"conn_info_rb"`
+	ConnMap         *ebpf.MapSpec `ebpf:"conn_map"`
+	ErrorRb         *ebpf.MapSpec `ebpf:"error_rb"`
+	EventRb         *ebpf.MapSpec `ebpf:"event_rb"`
+}
+
+// litmVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type litmVariableSpecs struct {
+	AF_FILTER            *ebpf.VariableSpec `ebpf:"AF_FILTER"`
+	FD_FILTER            *ebpf.VariableSpec `ebpf:"FD_FILTER"`
+	IPV4FILTER           *ebpf.VariableSpec `ebpf:"IPV4_FILTER"`
+	IPV6FILTER           *ebpf.VariableSpec `ebpf:"IPV6_FILTER"`
+	PID_FILTER           *ebpf.VariableSpec `ebpf:"PID_FILTER"`
+	PORT_FILTER          *ebpf.VariableSpec `ebpf:"PORT_FILTER"`
+	UnusedConnEvent      *ebpf.VariableSpec `ebpf:"unused_conn_event"`
+	UnusedConnectionInfo *ebpf.VariableSpec `ebpf:"unused_connection_info"`
+	UnusedDataEvent      *ebpf.VariableSpec `ebpf:"unused_data_event"`
+	UnusedError          *ebpf.VariableSpec `ebpf:"unused_error"`
+	UnusedErrorCodeEnum  *ebpf.VariableSpec `ebpf:"unused_error_code_enum"`
+	UnusedEventTypeEnum  *ebpf.VariableSpec `ebpf:"unused_event_type_enum"`
 }
 
 // litmObjects contains all objects after they have been loaded into the kernel.
@@ -113,6 +146,7 @@ type litmMapSpecs struct {
 type litmObjects struct {
 	litmPrograms
 	litmMaps
+	litmVariables
 }
 
 func (o *litmObjects) Close() error {
@@ -126,47 +160,71 @@ func (o *litmObjects) Close() error {
 //
 // It can be passed to loadLitmObjects or ebpf.CollectionSpec.LoadAndAssign.
 type litmMaps struct {
-	ActiveAcceptMap   *ebpf.Map `ebpf:"active_accept_map"`
-	ActiveCloseMap    *ebpf.Map `ebpf:"active_close_map"`
-	ActiveReadArgsMap *ebpf.Map `ebpf:"active_read_args_map"`
-	ConnEventsRb      *ebpf.Map `ebpf:"conn_events_rb"`
-	ConnMap           *ebpf.Map `ebpf:"conn_map"`
-	ErrorEventsRb     *ebpf.Map `ebpf:"error_events_rb"`
-	ReadEventsRb      *ebpf.Map `ebpf:"read_events_rb"`
+	ActiveAcceptMap *ebpf.Map `ebpf:"active_accept_map"`
+	ActiveIoMap     *ebpf.Map `ebpf:"active_io_map"`
+	ConnInfoRb      *ebpf.Map `ebpf:"conn_info_rb"`
+	ConnMap         *ebpf.Map `ebpf:"conn_map"`
+	ErrorRb         *ebpf.Map `ebpf:"error_rb"`
+	EventRb         *ebpf.Map `ebpf:"event_rb"`
 }
 
 func (m *litmMaps) Close() error {
 	return _LitmClose(
 		m.ActiveAcceptMap,
-		m.ActiveCloseMap,
-		m.ActiveReadArgsMap,
-		m.ConnEventsRb,
+		m.ActiveIoMap,
+		m.ConnInfoRb,
 		m.ConnMap,
-		m.ErrorEventsRb,
-		m.ReadEventsRb,
+		m.ErrorRb,
+		m.EventRb,
 	)
+}
+
+// litmVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadLitmObjects or ebpf.CollectionSpec.LoadAndAssign.
+type litmVariables struct {
+	AF_FILTER            *ebpf.Variable `ebpf:"AF_FILTER"`
+	FD_FILTER            *ebpf.Variable `ebpf:"FD_FILTER"`
+	IPV4FILTER           *ebpf.Variable `ebpf:"IPV4_FILTER"`
+	IPV6FILTER           *ebpf.Variable `ebpf:"IPV6_FILTER"`
+	PID_FILTER           *ebpf.Variable `ebpf:"PID_FILTER"`
+	PORT_FILTER          *ebpf.Variable `ebpf:"PORT_FILTER"`
+	UnusedConnEvent      *ebpf.Variable `ebpf:"unused_conn_event"`
+	UnusedConnectionInfo *ebpf.Variable `ebpf:"unused_connection_info"`
+	UnusedDataEvent      *ebpf.Variable `ebpf:"unused_data_event"`
+	UnusedError          *ebpf.Variable `ebpf:"unused_error"`
+	UnusedErrorCodeEnum  *ebpf.Variable `ebpf:"unused_error_code_enum"`
+	UnusedEventTypeEnum  *ebpf.Variable `ebpf:"unused_event_type_enum"`
 }
 
 // litmPrograms contains all programs after they have been loaded into the kernel.
 //
 // It can be passed to loadLitmObjects or ebpf.CollectionSpec.LoadAndAssign.
 type litmPrograms struct {
+	GetConnInfo    *ebpf.Program `ebpf:"get_conn_info"`
+	ServerExit     *ebpf.Program `ebpf:"server_exit"`
 	SysEnterAccept *ebpf.Program `ebpf:"sys_enter_accept"`
 	SysEnterClose  *ebpf.Program `ebpf:"sys_enter_close"`
-	SysEnterRead   *ebpf.Program `ebpf:"sys_enter_read"`
+	SysEnterIo     *ebpf.Program `ebpf:"sys_enter_io"`
 	SysExitAccept  *ebpf.Program `ebpf:"sys_exit_accept"`
-	SysExitClose   *ebpf.Program `ebpf:"sys_exit_close"`
-	SysExitRead    *ebpf.Program `ebpf:"sys_exit_read"`
+	SysExitIn      *ebpf.Program `ebpf:"sys_exit_in"`
+	SysExitInV     *ebpf.Program `ebpf:"sys_exit_in_v"`
+	SysExitOut     *ebpf.Program `ebpf:"sys_exit_out"`
+	SysExitOutV    *ebpf.Program `ebpf:"sys_exit_out_v"`
 }
 
 func (p *litmPrograms) Close() error {
 	return _LitmClose(
+		p.GetConnInfo,
+		p.ServerExit,
 		p.SysEnterAccept,
 		p.SysEnterClose,
-		p.SysEnterRead,
+		p.SysEnterIo,
 		p.SysExitAccept,
-		p.SysExitClose,
-		p.SysExitRead,
+		p.SysExitIn,
+		p.SysExitInV,
+		p.SysExitOut,
+		p.SysExitOutV,
 	)
 }
 

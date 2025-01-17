@@ -1,3 +1,3 @@
 package bpf
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -no-global-types -type conn_event_t -type error_event_t -type read_event_t -type conn_event -type error_code litm litm.bpf.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -no-global-types -type error_code -type error_t -type event_type -type data_event_t -type conn_event_t -type conn_info_event_t litm litm.bpf.c

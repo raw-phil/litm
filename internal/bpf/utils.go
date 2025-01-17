@@ -1,16 +1,20 @@
 package bpf
 
 import (
-	"bytes"
-	"encoding/binary"
+	"context"
 	"errors"
 	"fmt"
-	"log"
+	"net"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/ringbuf"
+)
+
+const (
+	AF_INET  = 2
+	AF_INET6 = 10
 )
 
 func CheckKernelFeatures() error {
@@ -39,37 +43,98 @@ func CheckKernelFeatures() error {
 	return nil
 }
 
-func LoadPrograms(pid uint32, listenFd int64) (*litmObjects, func(), error) {
-	objs := litmObjects{}
+func LoadPrograms(ctx context.Context, wg *sync.WaitGroup, pid uint32, fd int64, dAddr net.IP, dPort uint16) (*litmObjects, error) {
+	var objs litmObjects
+	var err error
+
+	defer func() {
+		if err == nil {
+			go func() {
+				defer wg.Done()
+				<-ctx.Done()
+				objs.Close()
+			}()
+		} else {
+			wg.Done()
+		}
+	}()
+
+	var afFilter uint8 = 0
+
+	// Check provided dAddr
+	if dAddr.To4() != nil {
+		afFilter = AF_INET
+	} else if dAddr.To16() != nil {
+		afFilter = AF_INET6
+	} else {
+		return nil, fmt.Errorf("LoadPrograms(): dAddr is not a valid IP %s", dAddr)
+	}
 
 	// Load the object file from disk using a bpf2go-generated scaffolding.
 	spec, err := loadLitm()
 	if err != nil {
-		return &objs, nil, fmt.Errorf("LoadPrograms(): %w", err)
+		return nil, fmt.Errorf("LoadPrograms(): %w", err)
 	}
 
-	// https://github.com/cilium/ebpf/discussions/795
-	err = spec.RewriteConstants(map[string]interface{}{
-		"PID_FILTER": pid,
-		"FD_FILTER":  listenFd,
-	})
+	err = spec.Variables["PID_FILTER"].Set(pid)
 	if err != nil {
-		return &objs, nil, fmt.Errorf("LoadPrograms(): %w", err)
+		return nil, fmt.Errorf("LoadPrograms(): %w", err)
+	}
+
+	err = spec.Variables["FD_FILTER"].Set(fd)
+	if err != nil {
+		return nil, fmt.Errorf("LoadPrograms(): %w", err)
+	}
+
+	err = spec.Variables["PORT_FILTER"].Set(dPort)
+	if err != nil {
+		return nil, fmt.Errorf("LoadPrograms(): %w", err)
+	}
+
+	err = spec.Variables["AF_FILTER"].Set(afFilter)
+	if err != nil {
+		return nil, fmt.Errorf("LoadPrograms(): %w", err)
+	}
+
+	if afFilter == AF_INET {
+		err = spec.Variables["IPV4_FILTER"].Set(dAddr.To4())
+		if err != nil {
+			return nil, fmt.Errorf("LoadPrograms(): %w", err)
+		}
+	} else {
+		err = spec.Variables["IPV6_FILTER"].Set(dAddr.To16())
+		if err != nil {
+			return nil, fmt.Errorf("LoadPrograms(): %w", err)
+		}
 	}
 
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		return &objs, nil, fmt.Errorf("LoadPrograms(): %w", err)
+		return nil, fmt.Errorf("LoadPrograms(): %w", err)
 	}
 
-	cleanup := func() {
-		objs.Close()
-	}
-
-	return &objs, cleanup, nil
+	return &objs, nil
 }
 
-func LinkPrograms(objs *litmObjects) (func(), error) {
+func LinkPrograms(ctx context.Context, wg *sync.WaitGroup, objs *litmObjects) error {
 	var cleanupFuncs []func()
+	var err error
+
+	defer func() {
+		if err != nil {
+			for _, fn := range cleanupFuncs {
+				fn()
+			}
+			wg.Done()
+		} else {
+			go func() {
+				defer wg.Done()
+				<-ctx.Done()
+				for _, fn := range cleanupFuncs {
+					fn()
+				}
+			}()
+		}
+	}()
 
 	// Helper to manage errors and cleanup
 	manageLink := func(l link.Link, err error) error {
@@ -80,162 +145,84 @@ func LinkPrograms(objs *litmObjects) (func(), error) {
 		return nil
 	}
 
-	if err := manageLink(link.Tracepoint("syscalls", "sys_enter_accept4", objs.SysEnterAccept, nil)); err != nil {
-		return nil, fmt.Errorf("LinkPrograms(): %w", err)
+	if err = manageLink(link.Tracepoint("sched", "sched_process_exit", objs.ServerExit, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
 	}
-	if err := manageLink(link.Tracepoint("syscalls", "sys_exit_accept4", objs.SysExitAccept, nil)); err != nil {
-		return nil, fmt.Errorf("LinkPrograms(): %w", err)
+	if err = manageLink(link.Tracepoint("syscalls", "sys_enter_accept4", objs.SysEnterAccept, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
 	}
-	if err := manageLink(link.Tracepoint("syscalls", "sys_enter_close", objs.SysEnterClose, nil)); err != nil {
-		return nil, fmt.Errorf("LinkPrograms(): %w", err)
+	if err = manageLink(link.Tracepoint("syscalls", "sys_exit_accept4", objs.SysExitAccept, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
 	}
-	if err := manageLink(link.Tracepoint("syscalls", "sys_exit_close", objs.SysExitClose, nil)); err != nil {
-		return nil, fmt.Errorf("LinkPrograms(): %w", err)
+	if err = manageLink(link.Tracepoint("syscalls", "sys_enter_accept", objs.SysEnterAccept, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
 	}
-	if err := manageLink(link.Tracepoint("syscalls", "sys_enter_read", objs.SysEnterRead, nil)); err != nil {
-		return nil, fmt.Errorf("LinkPrograms(): %w", err)
+	if err = manageLink(link.Tracepoint("syscalls", "sys_exit_accept", objs.SysExitAccept, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
 	}
-	if err := manageLink(link.Tracepoint("syscalls", "sys_exit_read", objs.SysExitRead, nil)); err != nil {
-		return nil, fmt.Errorf("LinkPrograms(): %w", err)
+	if err = manageLink(link.Tracepoint("syscalls", "sys_enter_close", objs.SysEnterClose, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
 	}
-
-	cleanup := func() {
-		for _, fn := range cleanupFuncs {
-			fn()
-		}
+	if err = manageLink(link.Tracepoint("sock", "inet_sock_set_state", objs.GetConnInfo, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
 	}
 
-	return cleanup, nil
+	// Receive syscalls
+	if err = manageLink(link.Tracepoint("syscalls", "sys_enter_read", objs.SysEnterIo, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+	if err = manageLink(link.Tracepoint("syscalls", "sys_exit_read", objs.SysExitIn, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+	if err = manageLink(link.Tracepoint("syscalls", "sys_enter_recvfrom", objs.SysEnterIo, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+	if err = manageLink(link.Tracepoint("syscalls", "sys_exit_recvfrom", objs.SysExitIn, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+	if err = manageLink(link.Tracepoint("syscalls", "sys_enter_readv", objs.SysEnterIo, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+	if err = manageLink(link.Tracepoint("syscalls", "sys_exit_readv", objs.SysExitInV, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+
+	// Send syscalls
+	if err = manageLink(link.Tracepoint("syscalls", "sys_enter_write", objs.SysEnterIo, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+	if err = manageLink(link.Tracepoint("syscalls", "sys_exit_write", objs.SysExitOut, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+	if err = manageLink(link.Tracepoint("syscalls", "sys_enter_sendto", objs.SysEnterIo, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+	if err = manageLink(link.Tracepoint("syscalls", "sys_exit_sendto", objs.SysExitOut, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+	if err = manageLink(link.Tracepoint("syscalls", "sys_enter_writev", objs.SysEnterIo, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+	if err = manageLink(link.Tracepoint("syscalls", "sys_exit_writev", objs.SysExitOutV, nil)); err != nil {
+		return fmt.Errorf("LinkPrograms(): %w", err)
+	}
+
+	return nil
 }
 
-func HandleErrorEventsRb(objs *litmObjects) (chan litmErrorEventT, func(), error) {
-	rd, err := ringbuf.NewReader(objs.ErrorEventsRb)
-	if err != nil {
-		return nil, nil, fmt.Errorf("HandleReadEventsRb(): %w", err)
-	}
+type ConnEvent litmConnEventT
 
-	ch := make(chan litmErrorEventT)
+type ConnInfoEvent litmConnInfoEventT
 
-	go func() {
-		defer close(ch)
-		var errorEvent litmErrorEventT
-		for {
-			record, err := rd.Read()
-			if err != nil {
-				if errors.Is(err, ringbuf.ErrClosed) {
-					return
-				}
-				log.Fatalf("HandleErrorEventsRb():reading from RingBuf: %s", err.Error())
-			}
+type DataEvent litmDataEventT
 
-			// Parse the ringbuf event entry into a litmErrorEventT structure.
-			if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &errorEvent); err != nil {
-				log.Fatalf("HandleErrorEventsRb(): parsing RingBuf event: %s", err.Error())
-			}
+type EventType litmEventType
 
-			select {
-			case ch <- errorEvent:
-			default:
-				log.Fatalf("HandleErrorEventsRb(): channel full, too much traffic")
-			}
-		}
-	}()
+type RbError litmErrorT
 
-	cleanup := func() {
-		rd.Close()
-	}
-
-	return ch, cleanup, nil
-}
-
-func HandleConnEventsRb(objs *litmObjects) (chan litmConnEventT, func(), error) {
-	rd, err := ringbuf.NewReader(objs.ConnEventsRb)
-	if err != nil {
-		return nil, nil, fmt.Errorf("HandleConnEventsRb(): %w", err)
-	}
-
-	ch := make(chan litmConnEventT)
-
-	go func() {
-		defer close(ch)
-		var connEvent litmConnEventT
-		for {
-			record, err := rd.Read()
-			if err != nil {
-				if errors.Is(err, ringbuf.ErrClosed) {
-					return
-				}
-				log.Fatalf("HandleConnEventsRb():reading from RingBuf: %s", err.Error())
-			}
-
-			// Parse the ringbuf event into a litmConnEventT structure.
-			if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &connEvent); err != nil {
-				log.Fatalf("HandleConnEventsRb(): parsing RingBuf event: %s", err.Error())
-
-			}
-
-			select {
-			case ch <- connEvent:
-			default:
-				log.Fatalf("HandleConnEventsRb(): channel full, too much traffic")
-			}
-		}
-	}()
-
-	cleanup := func() {
-		rd.Close()
-	}
-
-	return ch, cleanup, nil
-}
-
-type dataRead struct {
-	Fd   int64
-	Data []uint8
-}
-
-func HandleReadEventsRb(objs *litmObjects) (chan dataRead, func(), error) {
-	rd, err := ringbuf.NewReader(objs.ReadEventsRb)
-	if err != nil {
-		return nil, nil, fmt.Errorf("HandleReadEventsRb(): %w", err)
-	}
-
-	// TODO: Maybe have to be buffered for handling high traffic
-	ch := make(chan dataRead)
-
-	go func() {
-		defer close(ch)
-		var readEvent litmReadEventT
-		for {
-			record, err := rd.Read()
-			if err != nil {
-				if errors.Is(err, ringbuf.ErrClosed) {
-					return
-				}
-				log.Fatalf("HandleReadEventsRb():reading from RingBuf: %s", err.Error())
-			}
-
-			// Parse the ringbuf event entry into a litmReadEventT structure.
-			if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &readEvent); err != nil {
-				log.Fatalf("HandleReadEventsRb(): parsing RingBuf event: %s", err.Error())
-			}
-
-			data := dataRead{
-				Fd:   readEvent.Fd,
-				Data: readEvent.Msg[:readEvent.MsgLen],
-			}
-
-			select {
-			case ch <- data:
-			default:
-				log.Fatalf("HandleReadEventsRb(): channel full, too much traffic")
-			}
-		}
-	}()
-
-	cleanup := func() {
-		rd.Close()
-	}
-
-	return ch, cleanup, nil
-}
+const (
+	C_OPEN EventType = iota
+	C_CLOSE
+	DATA_IN
+	DATA_OUT
+)
