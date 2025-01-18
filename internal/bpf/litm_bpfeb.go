@@ -31,15 +31,15 @@ type litmDataEventT struct {
 	Buf  [1024]uint8
 }
 
-type litmErrorCode uint32
+type litmErrorCode int32
 
 const (
-	litmErrorCodeWR_EVENT_RB_FAIL     litmErrorCode = 4294967295
-	litmErrorCodeWR_BAD_EVENT_T       litmErrorCode = 4294967294
-	litmErrorCodeWR_INFO_RB_FAIL      litmErrorCode = 4294967293
-	litmErrorCodeMAP_OPERATION_FAIL   litmErrorCode = 4294967292
-	litmErrorCodePROBE_READ_USER_FAIL litmErrorCode = 4294967291
-	litmErrorCodeSERVER_EXIT          litmErrorCode = 4294967290
+	litmErrorCodeWR_EVENT_RB_FAIL     litmErrorCode = -1
+	litmErrorCodeWR_BAD_EVENT_T       litmErrorCode = -2
+	litmErrorCodeWR_INFO_RB_FAIL      litmErrorCode = -3
+	litmErrorCodeMAP_OPERATION_FAIL   litmErrorCode = -4
+	litmErrorCodePROBE_READ_USER_FAIL litmErrorCode = -5
+	litmErrorCodeSERVER_EXIT          litmErrorCode = -6
 )
 
 type litmErrorT struct {
