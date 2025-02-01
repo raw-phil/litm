@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
@@ -21,21 +21,22 @@ import (
 
 var stop sync.Once
 
-type pipePair struct {
-	reader *io.PipeReader
-	writer *io.PipeWriter
+type connPipe struct {
+	reader    *io.PipeReader
+	writer    *io.PipeWriter
+	bufWriter *bufio.Writer
 }
 
-// conn represents a network connection with associated input and output pipe pairs,
+// conn represents a network connection with associated input and output connPipe,
 // the remote address, and a channel for HTTP requests received.
 type conn struct {
-	// Input pipe pair.
+	// Input connPipe.
 	// Represents incoming data from the connection.
-	in pipePair
+	in connPipe
 
-	// Output pipe pair.
+	// Output connPipe.
 	// Represents outgoing data to the connection.
-	out pipePair
+	out connPipe
 
 	// Remote address of the connection (h:p).
 	remoteAddr string
@@ -61,7 +62,7 @@ type litmInstace struct {
 
 	// connMap is the map of connections indexed by FD.
 	// Keeps track of active network connections and their associated data.
-	connMap map[int64]conn
+	connMap map[int64]*conn
 
 	// resCh is the channel on which HTTP responses, along with their corresponding requests
 	// (accessible via (*http.Response).Request), captured by LITM are sent.
@@ -112,7 +113,7 @@ func NewLitm(eventRb *ebpf.Map, errorRb *ebpf.Map, connInfoRb *ebpf.Map) (Litm, 
 		eventRbReader:    eventRbReader,
 		errorRbReader:    errorRbReader,
 		connInfoRbReader: connInfoRbReader,
-		connMap:          make(map[int64]conn),
+		connMap:          make(map[int64]*conn),
 	}, nil
 }
 
@@ -158,6 +159,7 @@ func (l *litmInstace) rbEventConsumer() {
 		var record ringbuf.Record
 		for {
 			err := l.eventRbReader.ReadInto(&record)
+
 			if err != nil {
 				select {
 				case <-l.ctx.Done():
@@ -168,65 +170,47 @@ func (l *litmInstace) rbEventConsumer() {
 				}
 			}
 
-			var eventType bpf.EventType
-			if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &eventType); err != nil {
-				go l.stopWithErr(fmt.Errorf("rbEventConsumer(): parsing EventType: %w", err))
-				return
-			}
+			var eventType *bpf.EventType = (*bpf.EventType)(unsafe.Pointer(&record.RawSample[0]))
 
-			switch eventType {
+			switch *eventType {
 			case bpf.C_OPEN:
-				var connEvent bpf.ConnEvent
-				if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &connEvent); err != nil {
-					go l.stopWithErr(fmt.Errorf("rbEventConsumer(): parsing ConnEvent: %w", err))
-					return
-				}
+				var connEvent *bpf.ConnEvent = (*bpf.ConnEvent)(unsafe.Pointer(&record.RawSample[0]))
 				l.handleOpen(connEvent.Fd)
 
 			case bpf.C_CLOSE:
-				var connEvent bpf.ConnEvent
-				if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &connEvent); err != nil {
-					go l.stopWithErr(fmt.Errorf("rbEventConsumer(): parsing ConnEvent: %w", err))
-					return
-				}
+				var connEvent *bpf.ConnEvent = (*bpf.ConnEvent)(unsafe.Pointer(&record.RawSample[0]))
 				l.handleClose(connEvent.Fd)
 
 			case bpf.DATA_IN:
-				var dataEvent bpf.DataEvent
-				if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &dataEvent); err != nil {
-					go l.stopWithErr(fmt.Errorf("rbEventConsumer(): parsing DataEvent: %w", err))
+				var dataEvent *bpf.DataEvent = (*bpf.DataEvent)(unsafe.Pointer(&record.RawSample[0]))
+
+				conn, ok := l.connMap[dataEvent.Fd]
+				if !ok {
+					go l.stopWithErr(fmt.Errorf("rbEventConsumer(): write to closed conn"))
 					return
 				}
 
-				if conn, ok := l.connMap[dataEvent.Fd]; ok {
-					select {
-					case <-l.ctx.Done():
-						return
-					default:
-						conn.in.writer.Write(dataEvent.Buf[:dataEvent.Size])
-					}
-				} else {
-					go l.stopWithErr(fmt.Errorf("rbEventConsumer(): write to closed conn"))
+				select {
+				case <-l.ctx.Done():
 					return
+				default:
+					conn.in.bufWriter.Write(dataEvent.Buf[:dataEvent.Size])
 				}
 
 			case bpf.DATA_OUT:
-				var dataEvent bpf.DataEvent
-				if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &dataEvent); err != nil {
-					go l.stopWithErr(fmt.Errorf("rbEventConsumer(): parsing DataEvent: %w", err))
+				var dataEvent *bpf.DataEvent = (*bpf.DataEvent)(unsafe.Pointer(&record.RawSample[0]))
+
+				conn, ok := l.connMap[dataEvent.Fd]
+				if !ok {
+					go l.stopWithErr(fmt.Errorf("rbEventConsumer(): write to closed conn"))
 					return
 				}
 
-				if conn, ok := l.connMap[dataEvent.Fd]; ok {
-					select {
-					case <-l.ctx.Done():
-						return
-					default:
-						conn.out.writer.Write(dataEvent.Buf[:dataEvent.Size])
-					}
-				} else {
-					go l.stopWithErr(fmt.Errorf("rbEventConsumer(): write to closed conn"))
+				select {
+				case <-l.ctx.Done():
 					return
+				default:
+					conn.out.bufWriter.Write(dataEvent.Buf[:dataEvent.Size])
 				}
 
 			default:
@@ -243,7 +227,6 @@ func (l *litmInstace) rbErrConsumer() {
 	go func() {
 		defer l.wg.Done()
 
-		var bpfErr bpf.RbError
 		record, err := l.errorRbReader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
@@ -253,11 +236,7 @@ func (l *litmInstace) rbErrConsumer() {
 			return
 		}
 
-		// Parse the ringbuf event entry into a bpf.RbError structure.
-		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.NativeEndian, &bpfErr); err != nil {
-			go l.stopWithErr(fmt.Errorf("handleErrorEventsRb(): parsing RingBuf event: %w", err))
-			return
-		}
+		var bpfErr *bpf.RbError = (*bpf.RbError)(unsafe.Pointer(&record.RawSample[0]))
 
 		zeroIndex := bytes.IndexByte(bpfErr.Description[:], 0)
 		go l.stopWithErr(fmt.Errorf("bpf_error: code='%d',  description='%s'", bpfErr.Code, bpfErr.Description[:zeroIndex]))
@@ -287,11 +266,7 @@ func (l *litmInstace) handleOpen(fd int64) {
 		}
 	}
 
-	var connInfoEvent bpf.ConnInfoEvent
-	if err := binary.Read(bytes.NewBuffer(connInfoRecod.RawSample), binary.NativeEndian, &connInfoEvent); err != nil {
-		go l.stopWithErr(fmt.Errorf("handleOpen(): parsing EventType: %w", err))
-		return
-	}
+	var connInfoEvent *bpf.ConnInfoEvent = (*bpf.ConnInfoEvent)(unsafe.Pointer(&connInfoRecod.RawSample[0]))
 
 	var sAddr string
 
@@ -300,16 +275,16 @@ func (l *litmInstace) handleOpen(fd int64) {
 	} else if connInfoEvent.Family == bpf.AF_INET6 {
 		sAddr = fmt.Sprintf("[%s]", net.IP(connInfoEvent.Saddr[:16]).String())
 	} else {
-		go l.stopWithErr(fmt.Errorf("handleOpen(): unkniwn connInfoEvent.Family"))
+		go l.stopWithErr(fmt.Errorf("handleOpen(): unknown connInfoEvent.Family"))
 		return
 	}
 
-	l.connMap[fd] = conn{
-		in: pipePair{
-			reader: inPipeReader, writer: inPipeWriter,
+	l.connMap[fd] = &conn{
+		in: connPipe{
+			reader: inPipeReader, bufWriter: bufio.NewWriter(inPipeWriter), writer: inPipeWriter,
 		},
-		out: pipePair{
-			reader: outPipeReader, writer: outPipeWriter,
+		out: connPipe{
+			reader: outPipeReader, bufWriter: bufio.NewWriter(outPipeWriter), writer: outPipeWriter,
 		},
 		remoteAddr: fmt.Sprintf("%s:%d", sAddr, connInfoEvent.Sport),
 		reqCh:      make(chan *http.Request),
@@ -320,13 +295,20 @@ func (l *litmInstace) handleOpen(fd int64) {
 }
 
 func (l *litmInstace) handleClose(fd int64) {
-	if conn, ok := l.connMap[fd]; ok {
-		conn.in.writer.Close()
-		conn.out.writer.Close()
-		delete(l.connMap, fd)
-	} else {
+	var conn *conn
+	conn, ok := l.connMap[fd]
+	if !ok {
 		go l.stopWithErr(fmt.Errorf("handleClose(): close without open"))
+		return
 	}
+	delete(l.connMap, fd)
+	go func() {
+		conn.in.bufWriter.Flush()
+		conn.in.writer.Close()
+		conn.out.bufWriter.Flush()
+		conn.out.writer.Close()
+	}()
+
 }
 
 func (l *litmInstace) inDataToHttp(fd int64) {
@@ -409,20 +391,23 @@ func (l *litmInstace) outDataToHttp(fd int64) {
 					return
 				default:
 					// Should be some kind of warning, It does't block LITM
-					fmt.Fprintf(os.Stderr, "error: outDataToHttp(): http.ReadResponse(): %v", err)
+					fmt.Fprintf(os.Stderr, "error: outDataToHttp(): http.ReadResponse(): %v\n", err)
 					continue
 				}
 			}
 
-			_, err = io.ReadAll(res.Body)
+			b, err := io.ReadAll(res.Body)
 			if err != nil {
-				// For handling HEAD
+				// HEAD response
 				if !errors.Is(err, io.ErrUnexpectedEOF) {
 					go l.stopWithErr(fmt.Errorf("outDataToHttp(): read body: %w", err))
 					return
 				}
 			}
 			res.Body.Close()
+
+			// Used to store byte sent if Transfer-Encoding: chunked is used
+			res.ContentLength = int64(len(b))
 
 			req, ok := <-conn.reqCh
 			if !ok {
@@ -453,11 +438,11 @@ func (l *litmInstace) stopWithErr(err error) {
 }
 
 func (l *litmInstace) cleanup() {
-	for _, connection := range l.connMap {
-		connection.in.reader.Close()
-		connection.in.writer.Close()
-		connection.out.reader.Close()
-		connection.out.writer.Close()
+	for _, conn := range l.connMap {
+		conn.in.reader.Close()
+		conn.in.writer.Close()
+		conn.out.reader.Close()
+		conn.out.writer.Close()
 	}
 }
 
